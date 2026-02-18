@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Cardboard Passthrough AR</title>
+    <script src="https://aframe.io/releases/1.4.0/aframe.min.js"></script>
+  </head>
+  <body>
+    <a-scene>
+      <a-assets>
+        <video id="webcam" playsinline autoplay muted></video>
+      </a-assets>
+
+      <a-entity id="rig">
+        <a-camera position="0 1.6 0" look-controls>
+          <a-video 
+            src="#webcam" 
+            width="4" height="2.25" 
+            position="0 0 -2"
+            rotation="0 0 0">
+          </a-video>
+        </a-camera>
+      </a-entity>
+    </a-scene>
+
+    <script>
+      const video = document.querySelector('#webcam');
+
+      // 1. Request access to the smartphone's rear camera
+      if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+        const constraints = {
+          video: {
+            facingMode: 'environment', // Use back camera
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          }
+        };
+
+        navigator.mediaDevices.getUserMedia(constraints)
+          .then(function (stream) {
+            video.srcObject = stream;
+            video.play();
+          })
+          .catch(function (err) {
+            console.error("Camera access error: ", err);
+            alert("Could not access camera. Please ensure you are using HTTPS.");
+          });
+      }
+    </script>
+  </body>
+</html>
+
