@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, user-scalable=no">
+  <title>Cardboard Camera Viewer (Split View)</title>
+  <style>
+    :root {
+      /* Eye padding (gap between left and right) in CSS pixels */
+      --ipd-gap: 12px; 
+      --bg: #000;
+      --ui-fg: #fff;
+      --ui-bg: rgba(0,0,0,0.5);
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--ui-fg);
+      height: 100%;
+      overflow: hidden;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      touch-action: manipulation;
+    }
+
+    /* Container for stereo canvases */
+    #vrstage {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      grid-template-columns: 1fr var(--ipd-gap) 1fr;
+      align-items: center;
+      justify-items: stretch;
+      background: var(--bg);
+    }
+
+    canvas.eye {
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: #000;
+    }
+
+    /* The middle spacer represents the nose bridge / IPD gap */
+    #gap {
+      width: var(--ipd-gap);
+      height: 100%;
+      background: var(--bg);
+    }
+
+    /* On-screen controls (hidden in VR) */
+    #controls {
+      position: fixed;
+      left: 0; right: 0;
+      bottom: 0;
+      display: flex;
+      gap: 8px;
+      padding: env(safe-area-inset-bottom) 12px 12px 12px;
+      justify-content: center;
+      align-items: center;
+      z-index: 10;
+      pointer-events: auto;
+    }
+
+    .pill {
+      background: var(--ui-bg);
+      color: var(--ui-fg);
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 999px;
+      padding: 10px 14px;
+      font-size: 14px;
+      backdrop-filter: blur(6px);
+      -webkit-backdrop-filter: blur(6px);
+      user-select: none;
+    }
+
+    #hud {
+      position: fixed;
+      top: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 10;
+      color: #fff;
+      font-size: 12px;
+      background: var(--ui-bg);
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+
+    /* Simple circular reticle at screen center */
+    #reticle {
+      position: fixed;
+      left: 50%;
+      top: 50%;
+      width: 16px;
+      height: 16px;
+      margin-left: -8px;
+      margin-top: -8px;
+      border-radius: 50%;
+      border: 2px solid rgba(255,255,255,0.75);
+      box-shadow: 0 0 0 2px rgba(0,0,0,0.35);
+      pointer-events: none;
+      z-index: 5;
+    }
+
+    /* Hide controls in fullscreen “VR” mode for immersion */
+    .immersive #controls,
+    .immersive #hud {
+      display: none;
+    }
+
+    /* Hide video element (we draw onto canvases) */
+    video#cam {
+      position: fixed;
+      left: -9999px;
+      top: -9999px;
+      visibility: hidden;
+      width: 1px;
+      height: 1px;
+    }
+  </style>
+</head>
+<body>
+  <div id="hud">Ready</div>
+
+  <!-- Hidden camera video -->
+  <video id="cam" playsinline muted autoplay></video>
+
+  <div id="vrstage">
+    <canvas id="left"  class="eye"></canvas>
+    <div id="gap" aria-hidden="true"></div>
+    <canvas id="right" class="eye"></canvas>
+  </div>
+
+  <div id="reticle" aria-hidden="true"></div>
+
+  <div id="controls">
+    <button class="pill" id="btnStart">Start Camera</button>
+    <button class="pill" id="btnVR">Enter VR</button>
+    <button class="pill" id="btnExitVR" style="display:none;">Exit VR</button>
+    <button class="pill" id="btnSwap">Swap Eyes</button>
+    <label class="pill" style="display:flex;align-items:center;gap:8px;">
+      IPD Gap
+      <input id="ipd" type="range" min="0" max="40" value="12" />
+    </label>
+  </div>
+
+  <script>
+    const state = {
+      stream: null,
+      started: false,
+      swap: false,
+      animationId: null,
+      aspectFit: true, // set to false to cover (like object-fit: cover)
+    };
+
+    const el = {
+      hud: document.getElementById('hud'),
+      cam: document.getElementById('cam'),
+      left: document.getElementById('left'),
+      right: document.getElementById('right'),
+      btnStart: document.getElementById('btnStart'),
+      btnVR: document.getElementById('btnVR'),
+      btnExitVR: document.getElementById('btnExitVR'),
+      btnSwap: document.getElementById('btnSwap'),
+      ipd: document.getElementById('ipd'),
+      root: document.documentElement,
+      body: document.body,
+    };
+
+    // Choose rear camera if possible
+    async function getRearCameraStream() {
+      const constraints = {
+        audio: false,
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1920 },
+          height: { ideal: 1080 },
+          frameRate: { ideal: 60, max: 60 }
+        }
+      };
+      try {
+        return await navigator.mediaDevices.getUserMedia(constraints);
+      } catch (e) {
+        // Fallback to any camera
+        return navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      }
+    }
+
+    function setHUD(msg) { el.hud.textContent = msg; }
+
+    function resizeCanvases() {
+      // Make each canvas exactly the size of its CSS box to avoid scaling blur.
+      for (const c of [el.left, el.right]) {
+        const rect = c.getBoundingClientRect();
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        c.width = Math.floor(rect.width * dpr);
+        c.height = Math.floor(rect.height * dpr);
+      }
+    }
+
+    // Optional “barrel distortion” placeholder (identity by default).
+    // For real lens correction, you’d warp with fragment shaders (WebGL) or
+    // precompute UV maps. Keeping it simple here for performance & clarity.
+    function drawEye(ctx, video, dstW, dstH) {
+      const vw = video.videoWidth;
+      const vh = video.videoHeight;
+      if (!vw || !vh) return;
+
+      // Compute fit
+      let sx = 0, sy = 0, sw = vw, sh = vh;
+      const vidAspect = vw / vh;
+      const dstAspect = dstW / dstH;
+
+      if (state.aspectFit) {
+        // Contain
+        if (vidAspect > dstAspect) {
+          // video wider than dst -> letterbox top/bottom
+          const newH = vw / dstAspect;
+          const pad = (newH - vh) / 2;
+          sy = -pad;
+          sh = vh + 2 * pad;
+        } else {
+          // video taller -> pillarbox left/right
+          const newW = vh * dstAspect;
+          const pad = (newW - vw) / 2;
+          sx = -pad;
+          sw = vw + 2 * pad;
+        }
+      } else {
+        // Cover
+        if (vidAspect > dstAspect) {
+          // video wider -> crop sides
+          const newW = vh * dstAspect;
+          const crop = (vw - newW) / 2;
+          sx = crop;
+          sw = newW;
+        } else {
+          // video taller -> crop top/bottom
+          const newH = vw / dstAspect;
+          const crop = (vh - newH) / 2;
+          sy = crop;
+          sh = newH;
+        }
+      }
+
+      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dstW, dstH);
+    }
+
+    function render() {
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const lctx = el.left.getContext('2d');
+      const rctx = el.right.getContext('2d');
+
+      const [left, right] = state.swap ? [rctx, lctx] : [lctx, rctx];
+
+      // Clear
+      for (const ctx of [lctx, rctx]) {
+        ctx.save();
+        ctx.setTransform(1,0,0,1,0,0);
+        ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+        ctx.restore();
+      }
+
+      drawEye(left, el.cam, el.left.width, el.left.height);
+      drawEye(right, el.cam, el.right.width, el.right.height);
+
+      state.animationId = requestAnimationFrame(render);
+    }
+
+    async function startCamera() {
+      if (!('mediaDevices' in navigator) || !navigator.mediaDevices.getUserMedia) {
+        setHUD('Camera API not supported on this browser.');
+        return;
+      }
+      try {
+        setHUD('Starting camera…');
+        const stream = await getRearCameraStream();
+        state.stream = stream;
+        el.cam.srcObject = stream;
+
+        // iOS sometimes needs play() after a user gesture
+        await el.cam.play();
+        state.started = true;
+        setHUD('Camera started');
+        resizeCanvases();
+        if (!state.animationId) render();
+      } catch (err) {
+        console.error(err);
+        setHUD('Failed to start camera. Check permissions & HTTPS.');
+      }
+    }
+
+    async function enterVRLike() {
+      // Fullscreen
+      const root = document.documentElement;
+      if (root.requestFullscreen) await root.requestFullscreen({ navigationUI: "hide" });
+      else if (root.webkitRequestFullscreen) root.webkitRequestFullscreen();
+
+      // Lock to landscape (best effort; may require user gesture)
+      try {
+        await screen.orientation.lock('landscape');
+      } catch (e) {
+        // Not all browsers allow programmatic lock; that’s OK.
+      }
+
+      el.body.classList.add('immersive');
+      el.btnVR.style.display = 'none';
+      el.btnExitVR.style.display = 'inline-block';
+      setHUD('Immersive');
+    }
+
+    async function exitVRLike() {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      try {
+        await screen.orientation.unlock?.();
+      } catch (e) {}
+      el.body.classList.remove('immersive');
+      el.btnVR.style.display = 'inline-block';
+      el.btnExitVR.style.display = 'none';
+      setHUD('Exited VR');
+    }
+
+    function stopCamera() {
+      if (state.stream) {
+        state.stream.getTracks().forEach(t => t.stop());
+        state.stream = null;
+      }
+      state.started = false;
+      if (state.animationId) {
+        cancelAnimationFrame(state.animationId);
+        state.animationId = null;
+      }
+      setHUD('Camera stopped');
+    }
+
+    // Events
+    window.addEventListener('resize', resizeCanvases);
+    window.addEventListener('orientationchange', () => {
+      setTimeout(resizeCanvases, 100);
+    });
+
+    el.btnStart.addEventListener('click', async () => {
+      if (!state.started) {
+        await startCamera();
+      } else {
+        stopCamera();
+      }
+      el.btnStart.textContent = state.started ? 'Stop Camera' : 'Start Camera';
+    });
+
+    el.btnVR.addEventListener('click', async () => {
+      if (!state.started) await startCamera();
+      await enterVRLike();
+    });
+
+    el.btnExitVR.addEventListener('click', exitVRLike);
+
+    el.btnSwap.addEventListener('click', () => {
+      state.swap = !state.swap;
+    });
+
+    el.ipd.addEventListener('input', (e) => {
+      const v = `${e.target.value}px`;
+      el.root.style.setProperty('--ipd-gap', v);
+    });
+
+    // Start quietly if permissions already granted and user interacts
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && state.started && !state.animationId) {
+        render();
+      }
+    });
+
+    // Attempt to pre-size canvases on load
+    window.addEventListener('load', resizeCanvases);
+  </script>
+</body>
+</html>

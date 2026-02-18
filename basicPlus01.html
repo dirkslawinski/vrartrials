@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta
+  name="viewport"
+  content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Cardboard Passthrough (WebGL + Lens Warp + Head Tracking)</title>
+<style>
+  :root {
+    --ui-bg: rgba(0,0,0,0.55);
+    --ui-fg: #fff;
+    --gap-px: 14;          /* center gap (IPD spacer) in CSS px */
+    --reticle-size: 18;    /* CSS px; adjusted for DPR in WebGL */
+  }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #000; color: var(--ui-fg);
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    overflow: hidden;
+    touch-action: manipulation;
+  }
+  #gl {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    display: block; background: #000;
+  }
+  /* hidden camera video (used as texture) */
+  #cam {
+    position: fixed; left: -9999px; top: -9999px; width: 1px; height: 1px; visibility: hidden;
+  }
+
+  #controls {
+    position: fixed; left: 0; right: 0; bottom: 0;
+    display: flex; flex-wrap: wrap; gap: 8px;
+    padding: 10px env(safe-area-inset-right) calc(10px + env(safe-area-inset-bottom)) env(safe-area-inset-left);
+    justify-content: center; align-items: center;
+    z-index: 7;
+  }
+  .pill {
+    background: var(--ui-bg);
+    color: var(--ui-fg);
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 999px; padding: 8px 12px; font-size: 14px;
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  }
+  .pill input[type="range"] { vertical-align: middle; }
+
+  #hud {
+    position: fixed; top: 8px; left: 50%; transform: translateX(-50%);
+    background: var(--ui-bg); color: #fff; font-size: 12px;
+    padding: 6px 10px; border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.2);
+    z-index: 8;
+    user-select: none;
+  }
+  .immersive #controls, .immersive #hud { display: none; } /* hide UI in VR mode */
+
+  /* middle gap overlay (purely visual) */
+  #gap {
+    position: fixed; top: 0; bottom: 0; left: 50%;
+    transform: translateX(calc(-50% - (var(--gap-px) / 2)));
+    width: calc(var(--gap-px) * 1px);
+    background: #000;
+    z-index: 5; pointer-events: none;
+  }
+
+</style>
+</head>
+<body>
+  <div id="hud">Ready</div>
+  <div id="gap" aria-hidden="true"></div>
+  <canvas id="gl"></canvas>
+  <video id="cam" playsinline muted autoplay></video>
+
+  <div id="controls">
+    <button class="pill" id="btnStart">Start Camera</button>
+    <button class="pill" id="btnVR">Enter VR</button>
+    <button class="pill" id="btnExitVR" style="display:none;">Exit VR</button>
+    <button class="pill" id="btnCenter">Recenter</button>
+    <label class="pill" style="display:flex;align-items:center;gap:8px;">
+      Gap
+      <input id="rngGap" type="range" min="0" max="60" value="14">
+    </label>
+    <label class="pill" style="display:flex;align-items:center;gap:8px;">
+      Distortion
+      <input id="rngK" type="range" min="0" max="100" value="55">
+    </label>
+    <label class="pill" style="display:flex;align-items:center;gap:8px;">
+      Chrom. Aber.
+      <input id="chkCA" type="checkbox" checked>
+    </label>
+  </div>
+
+<script>
+/** ======================
+ *  Utility & State
+ *  ====================== */
+const el = {
+  gl: document.getElementById('gl'),
+  cam: document.getElementById('cam'),
+  hud: document.getElementById('hud'),
+  btnStart: document.getElementById('btnStart'),
+  btnVR: document.getElementById('btnVR'),
+  btnExitVR: document.getElementById('btnExitVR'),
+  btnCenter: document.getElementById('btnCenter'),
+  rngGap: document.getElementById('rngGap'),
+  rngK: document.getElementById('rngK'),
+  chkCA: document.getElementById('chkCA'),
+  body: document.body,
+  root: document.documentElement,
+};
+
+const state = {
+  stream: null,
+  started: false,
+  gl: null,
+  prog: null,
+  progReticle: null,
+  tex: null,
+  vao: null,
+  dpr: Math.max(1, window.devicePixelRatio || 1),
+  animationId: null,
+  // Camera source rect in the video texture (for "cover" fit)
+  srcOrigin: [0, 0],
+  srcScale: [1, 1],
+  // Distortion params
+  kBase: 0.55,             // UI 0..1 mapped to Hmd K parameters below
+  chromAb: true,
+  // Head tracking
+  head: {
+    yaw0: 0, pitch0: 0, roll0: 0,   // recenter baseline
+    yaw: 0, pitch: 0, roll: 0,      // current (deg)
+    smoothYaw: 0, smoothPitch: 0,
+  },
+};
+
+/** ======================
+ *  WebGL Setup
+ *  ====================== */
+function createGL() {
+  const gl = el.gl.getContext('webgl', {
+    alpha: false, antialias: true, depth: false, stencil: false, preserveDrawingBuffer: false,
+    powerPreference: 'high-performance',
+  });
+  if (!gl) throw new Error('WebGL not supported');
+  state.gl = gl;
+
+  // Fullscreen triangle (2D) to avoid index buffers
+  const vs = `
+    attribute vec2 aPos;
+    varying vec2 vUV;
+    void main() {
+      vUV = aPos * 0.5 + 0.5;     // NDC [-1,1] -> UV [0,1]
+      gl_Position = vec4(aPos, 0.0, 1.0);
+    }
+  `;
+
+  // Barrel distortion + optional chromatic aberration. UV mapping uses a "cover" rect.
+  const fs = `
+    precision mediump float;
+    varying vec2 vUV;
+    uniform sampler2D uTex;
+    // Distortion pipeline
+    uniform vec2 uLensCenter;   // usually vec2(0.5, 0.5) per eye viewport
+    uniform vec2 uScale;        // default (0.5, 0.5)
+    uniform vec2 uScaleIn;      // default (2.0, 2.0)
+    uniform vec4 uHmdWarpParam; // K0..K3 (k0=1)
+    uniform vec4 uChromAbParam; // (Ax, Ay, Bx, By)
+    uniform bool uDoCA;
+
+    // Video "cover" mapping inside video texture
+    uniform vec2 uSrcOrigin;    // top-left in [0,1] of video
+    uniform vec2 uSrcScale;     // size in [0,1] of video
+
+    void main() {
+      // Map [0,1] UV -> pre-warp lens space around uLensCenter
+      vec2 p = (vUV - uLensCenter) * uScaleIn;   // [-1,1] when uScaleIn=(2,2)
+      float r2 = dot(p, p);
+      float k = uHmdWarpParam.x +
+                uHmdWarpParam.y * r2 +
+                uHmdWarpParam.z * r2 * r2 +
+                uHmdWarpParam.w * r2 * r2 * r2;
+
+      // Green channel (reference)
+      vec2 pG = p * k;
+      vec2 uvG = uLensCenter + uScale * pG;
+
+      // Outside of the lens bounds -> black vignette
+      if (uvG.x < 0.0 || uvG.x > 1.0 || uvG.y < 0.0 || uvG.y > 1.0) {
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+      }
+
+      // Apply chromatic aberration (optional)
+      vec2 uvR = uvG;
+      vec2 uvB = uvG;
+      if (uDoCA) {
+        vec2 rShift = (uChromAbParam.xy) * r2;   // small radial offset
+        vec2 bShift = (uChromAbParam.zw) * r2;
+        uvR = uLensCenter + uScale * (pG + rShift);
+        uvB = uLensCenter + uScale * (pG + bShift);
+      }
+
+      // Map to video source rect ("cover")
+      vec2 texUV_G = uSrcOrigin + uvG * uSrcScale;
+      vec2 texUV_R = uSrcOrigin + uvR * uSrcScale;
+      vec2 texUV_B = uSrcOrigin + uvB * uSrcScale;
+
+      // Sample (simple; could add gamma handling if needed)
+      float r = texture2D(uTex, texUV_R).r;
+      float g = texture2D(uTex, texUV_G).g;
+      float b = texture2D(uTex, texUV_B).b;
+      gl_FragColor = vec4(r, g, b, 1.0);
+    }
+  `;
+
+  state.prog = createProgram(gl, vs, fs);
+
+  // Reticle shader (post-warp overlay, draws a circular point)
+  const vs2 = `
+    attribute vec2 aPos;       // clip-space [-1,1]
+    uniform float uPointSize;  // in pixels
+    void main() {
+      gl_PointSize = uPointSize;
+      gl_Position = vec4(aPos, 0.0, 1.0);
+    }
+  `;
+  const fs2 = `
+    precision mediump float;
+    uniform vec4 uColor;
+    void main() {
+      // circular point with a thin ring
+      vec2 uv = gl_PointCoord - vec2(0.5);
+      float d = length(uv);
+      float R = 0.48;          // radius
+      float border = 0.10;     // ring thickness
+      float alpha = smoothstep(R, R - 0.02, d) - smoothstep(R - border, R - border - 0.02, d);
+      gl_FragColor = vec4(uColor.rgb, uColor.a * alpha);
+    }
+  `;
+  state.progReticle = createProgram(gl, vs2, fs2);
+
+  // Create full-screen triangle VAO (two triangles)
+  const vao = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vao);
+  // Two triangles covering clip space
+  const verts = new Float32Array([
+    -1, -1,   1, -1,   -1,  1,
+     1, -1,   1,  1,   -1,  1
+  ]);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  state.vao = vao;
+
+  // Texture for video
+  state.tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, state.tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+}
+
+function createProgram(gl, vsSrc, fsSrc) {
+  function compile(type, src) {
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, src);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(sh);
+      gl.deleteShader(sh);
+      throw new Error('Shader compile error: ' + log);
+    }
+    return sh;
+  }
+  const vs = compile(gl.VERTEX_SHADER, vsSrc);
+  const fs = compile(gl.FRAGMENT_SHADER, fsSrc);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    const log = gl.getProgramInfoLog(prog);
+    throw new Error('Program link error: ' + log);
+  }
+  return prog;
+}
+
+/** ======================
+ *  Camera & Texture
+ *  ====================== */
+async function startCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) {
+    setHUD('Camera API not supported.');
+    return;
+  }
+  try {
+    setHUD('Starting camera...');
+    const constraints = {
+      audio: false,
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1920 }, height: { ideal: 1080 },
+        frameRate: { ideal: 60, max: 60 }
+      }
+    };
+    state.stream = await navigator.mediaDevices.getUserMedia(constraints);
+    el.cam.srcObject = state.stream;
+    await el.cam.play();
+    state.started = true;
+    setHUD('Camera started');
+    resizeGL();
+    if (!state.animationId) render();
+  } catch (e) {
+    console.error(e);
+    setHUD('Camera failed. Check HTTPS & permissions.');
+  }
+}
+
+function stopCamera() {
+  if (state.stream) {
+    state.stream.getTracks().forEach(t => t.stop());
+    state.stream = null;
+  }
+  state.started = false;
+  if (state.animationId) {
+    cancelAnimationFrame(state.animationId);
+    state.animationId = null;
+  }
+  setHUD('Camera stopped');
+}
+
+/** ======================
+ *  Layout, Viewports, Fit
+ *  ====================== */
+function resizeGL() {
+  const gl = state.gl;
+  const dpr = state.dpr = Math.max(1, window.devicePixelRatio || 1);
+  const rect = el.gl.getBoundingClientRect();
+  const w = Math.floor(rect.width * dpr);
+  const h = Math.floor(rect.height * dpr);
+  if (el.gl.width !== w || el.gl.height !== h) {
+    el.gl.width = w; el.gl.height = h;
+  }
+  // Compute source rect for "cover" fitting (same for both eyes)
+  if (el.cam.videoWidth && el.cam.videoHeight) {
+    const vw = el.cam.videoWidth; const vh = el.cam.videoHeight;
+    const dstAspect = (w) / (h); // full canvas aspect; good enough
+    const vidAspect = vw / vh;
+    let sx=0, sy=0, sw=vw, sh=vh;
+    if (vidAspect > dstAspect) {
+      // Video wider -> crop sides
+      const newW = vh * dstAspect;
+      const crop = (vw - newW) / 2;
+      sx = crop; sw = newW;
+    } else {
+      // Video taller -> crop top/bottom
+      const newH = vw / dstAspect;
+      const crop = (vh - newH) / 2;
+      sy = crop; sh = newH;
+    }
+    state.srcOrigin = [sx / vw, sy / vh];
+    state.srcScale = [sw / vw, sh / vh];
+  }
+}
+
+/** ======================
+ *  Head Tracking (DeviceOrientation)
+ *  ====================== */
+function normalizeAngleDeg(a) {
+  a = (a + 180) % 360; if (a < 0) a += 360; return a - 180;
+}
+function recenter() {
+  state.head.yaw0 = state.head.yaw;
+  state.head.pitch0 = state.head.pitch;
+  state.head.roll0 = state.head.roll;
+  setHUD('Recentered');
+}
+function onDeviceOrientation(e) {
+  // Z-X'-Y'' intrinsic (alpha=z, beta=x, gamma=y)
+  let { alpha, beta, gamma } = e;
+  if (alpha == null || beta == null || gamma == null) return;
+
+  // Map to yaw (Z), pitch (X), roll (Y)
+  let yaw = alpha;          // 0..360
+  let pitch = beta;         // -180..180
+  let roll = gamma;         // -90..90
+
+  // Adjust by screen orientation
+  const angle = (screen.orientation?.angle || window.orientation || 0);
+  // Basic remap for landscape-primary (90) and landscape-secondary (270/-90)
+  if (angle === 90) {
+    // rotate frame by -90: swap axes
+    const t = pitch; pitch = -roll; roll = t;
+  } else if (angle === -90 || angle === 270) {
+    const t = pitch; pitch = roll; roll = -t;
+  }
+
+  state.head.yaw = yaw;
+  state.head.pitch = pitch;
+  state.head.roll = roll;
+
+  // Smooth (simple lerp)
+  const ly = state.head.smoothYaw, lp = state.head.smoothPitch;
+  const targetYaw = normalizeAngleDeg(yaw - state.head.yaw0);
+  const targetPitch = (pitch - state.head.pitch0);
+  const s = 0.15; // smoothing factor
+  state.head.smoothYaw = ly + (targetYaw - ly) * s;
+  state.head.smoothPitch = lp + (targetPitch - lp) * s;
+}
+
+/** ======================
+ *  Rendering
+ *  ====================== */
+function render() {
+  const gl = state.gl;
+  state.animationId = requestAnimationFrame(render);
+
+  // Update video texture if ready
+  if (el.cam.readyState >= 2) {
+    gl.bindTexture(gl.TEXTURE_2D, state.tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, el.cam); }
+    catch (e) { /* some browsers need dimensions first; ignore */ }
+  }
+
+  const W = el.gl.width, H = el.gl.height;
+  gl.viewport(0, 0, W, H);
+  gl.disable(gl.SCISSOR_TEST);
+  gl.clearColor(0,0,0,1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // Viewports for left/right with a middle gap (in *device* pixels)
+  const gapCss = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--gap-px')) || 0;
+  const gap = Math.floor(gapCss * state.dpr);
+  const eyeW = Math.floor((W - gap) / 2);
+  const eyeH = H;
+
+  // Distortion parameters (tuned for Cardboard-ish lenses; adjust kStrength)
+  const kStrength = parseFloat(el.rngK.value) / 100; // 0..1
+  // Base set: K0 fixed 1.0, K1 negative barrel, K2 small, K3 near zero
+  const K0 = 1.0;
+  const K1 = mix(-0.22, -0.34, kStrength);
+  const K2 = mix( 0.24,  0.55, kStrength);
+  const K3 = mix( 0.00,  0.10, kStrength);
+  // Chromatic aberration small shifts (tuned, can refine per lens)
+  const chrom = el.chkCA.checked;
+  const CAxR =  0.006, CAyR =  0.006;
+  const CAxB = -0.006, CAyB = -0.006;
+
+  // Common uniforms for video mapping
+  const srcOrigin = state.srcOrigin;
+  const srcScale  = state.srcScale;
+
+  // Draw eyes
+  gl.useProgram(state.prog);
+
+  // Bind geometry
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.vao);
+  const aPosLoc = gl.getAttribLocation(state.prog, 'aPos');
+  gl.enableVertexAttribArray(aPosLoc);
+  gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+  // Set static uniforms
+  const locs = cacheUniforms(gl, state.prog, [
+    'uTex','uLensCenter','uScale','uScaleIn','uHmdWarpParam','uChromAbParam',
+    'uDoCA','uSrcOrigin','uSrcScale'
+  ]);
+  gl.uniform1i(locs.uTex, 0);
+  gl.uniform2f(locs.uScale, 0.5, 0.5);
+  gl.uniform2f(locs.uScaleIn, 2.0, 2.0);
+  gl.uniform4f(locs.uHmdWarpParam, K0, K1, K2, K3);
+  gl.uniform4f(locs.uChromAbParam, CAxR, CAyR, CAxB, CAyB);
+  gl.uniform1i(locs.uDoCA, chrom ? 1 : 0);
+  gl.uniform2f(locs.uSrcOrigin, srcOrigin[0], srcOrigin[1]);
+  gl.uniform2f(locs.uSrcScale,  srcScale[0],  srcScale[1]);
+
+  // LEFT eye
+  gl.enable(gl.SCISSOR_TEST);
+  gl.viewport(0, 0, eyeW, eyeH);
+  gl.scissor(0, 0, eyeW, eyeH);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.uniform2f(locs.uLensCenter, 0.5, 0.5);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  // RIGHT eye
+  const xRight = eyeW + gap;
+  gl.viewport(xRight, 0, eyeW, eyeH);
+  gl.scissor(xRight, 0, eyeW, eyeH);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.uniform2f(locs.uLensCenter, 0.5, 0.5);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  gl.disable(gl.SCISSOR_TEST);
+
+  // Draw head-tracked reticle as a circular point in each eye (post-warp)
+  drawReticle(0, 0, eyeW, eyeH);           // left viewport
+  drawReticle(1, xRight, 0, eyeW, eyeH);   // right viewport
+}
+
+function drawReticle(eyeIndex, x = 0, y = 0, w, h) {
+  const gl = state.gl;
+  const yaw = state.head.smoothYaw;   // deg
+  const pitch = state.head.smoothPitch;
+
+  // Map ±θ degrees to ±offset in clip space (post-warp)
+  const yawRange = 20;    // degrees range to full deflection
+  const pitchRange = 20;
+  const maxNdc = 0.25;    // how far from center (clip-space) the point moves
+
+  const nx = clamp(yaw / yawRange, -1, 1) * maxNdc;
+  const ny = clamp(-pitch / pitchRange, -1, 1) * maxNdc;
+
+  // Convert per-eye offset to clip space within that viewport
+  // Center per eye is eye-local clip (0,0). We need to convert to full canvas clip.
+  const W = el.gl.width, H = el.gl.height;
+  const cx = x + w * (0.5 + nx);
+  const cy = y + h * (0.5 + ny);
+  const clipX = (cx / W) * 2.0 - 1.0;
+  const clipY = 1.0 - (cy / H) * 2.0;
+
+  gl.useProgram(state.progReticle);
+  const aPos = gl.getAttribLocation(state.progReticle, 'aPos');
+  const uPointSize = gl.getUniformLocation(state.progReticle, 'uPointSize');
+  const uColor = gl.getUniformLocation(state.progReticle, 'uColor');
+
+  // One point
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([clipX, clipY]), gl.STREAM_DRAW);
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  const cssPx = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--reticle-size')) || 18;
+  gl.uniform1f(uPointSize, cssPx * state.dpr);
+  gl.uniform4f(uColor, 1.0, 1.0, 1.0, 0.95);
+  gl.drawArrays(gl.POINTS, 0, 1);
+
+  gl.deleteBuffer(buf); // keep it simple; you can persist this buffer for perf
+}
+
+function cacheUniforms(gl, prog, names) {
+  const map = {};
+  for (const n of names) map[n] = gl.getUniformLocation(prog, n);
+  return map;
+}
+function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+function mix(a, b, t) { return a + (b - a) * t; }
+
+/** ======================
+ *  Fullscreen / VR-like
+ *  ====================== */
+async function enterVRLike() {
+  const root = document.documentElement;
+  if (root.requestFullscreen) await root.requestFullscreen({ navigationUI: "hide" });
+  try { await screen.orientation.lock('landscape'); } catch (e) {}
+  el.body.classList.add('immersive');
+  el.btnVR.style.display = 'none';
+  el.btnExitVR.style.display = 'inline-block';
+}
+async function exitVRLike() {
+  if (document.fullscreenElement) await document.exitFullscreen();
+  try { screen.orientation.unlock?.(); } catch (e) {}
+  el.body.classList.remove('immersive');
+  el.btnVR.style.display = 'inline-block';
+  el.btnExitVR.style.display = 'none';
+}
+
+/** ======================
+ *  Events & UI
+ *  ====================== */
+function setHUD(m) { el.hud.textContent = m; }
+
+function updateGapCss() {
+  const gap = parseInt(el.rngGap.value);
+  document.documentElement.style.setProperty('--gap-px', gap.toString());
+}
+
+function requestMotionPermissionIfNeeded() {
+  // iOS gated; Android often allows by default (or site setting).
+  const DOR = window.DeviceOrientationEvent;
+  if (typeof DOR !== 'undefined' && DOR?.requestPermission) {
+    DOR.requestPermission().catch(()=>{}).then(res => {
+      // res === 'granted' on iOS
+    });
+  }
+}
+
+function onStartClick() {
+  if (!state.started) {
+    startCamera().then(() => requestMotionPermissionIfNeeded());
+    el.btnStart.textContent = 'Stop Camera';
+  } else {
+    stopCamera();
+    el.btnStart.textContent = 'Start Camera';
+  }
+}
+
+function init() {
+  createGL();
+  // UI bindings
+  el.btnStart.addEventListener('click', onStartClick);
+  el.btnVR.addEventListener('click', async () => {
+    if (!state.started) await startCamera();
+    await enterVRLike();
+  });
+  el.btnExitVR.addEventListener('click', exitVRLike);
+  el.btnCenter.addEventListener('click', recenter);
+  el.rngGap.addEventListener('input', updateGapCss);
+  el.rngK.addEventListener('input', ()=>{}); // read in render
+  el.chkCA.addEventListener('change', ()=>{});
+  updateGapCss();
+
+  // Orientation events
+  window.addEventListener('deviceorientation', onDeviceOrientation, { passive: true });
+
+  // Resize
+  window.addEventListener('resize', resizeGL);
+  window.addEventListener('orientationchange', () => setTimeout(resizeGL, 100));
+
+  // Kick off
+  resizeGL();
+  setHUD('Ready (tap Start Camera)');
+}
+
+window.addEventListener('load', init);
+</script>
+</body>
+</html>
+``
