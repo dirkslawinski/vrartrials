@@ -1,36 +1,48 @@
 <!DOCTYPE html>
 <html>
   <head>
+    <title>Cardboard Passthrough VR</title>
     <script src="https://aframe.io/releases/1.4.0/aframe.min.js"></script>
     <style>
-      #start-btn {
+      /* Style for the permission button */
+      #ui-overlay {
         position: fixed;
-        top: 20px;
-        left: 20px;
-        z-index: 999;
-        padding: 15px;
-        background: #222;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        z-index: 1000;
+      }
+      button {
+        padding: 20px 40px;
+        font-size: 1.2rem;
+        background: #ed213a;
         color: white;
         border: none;
-        border-radius: 8px;
+        border-radius: 50px;
+        cursor: pointer;
       }
     </style>
   </head>
   <body>
-    <button id="start-btn">Start Camera</button>
 
-    <a-scene>
+    <div id="ui-overlay">
+      <button id="start-btn">ENABLE CAMERA</button>
+    </div>
+
+    <a-scene xr-mode-ui="enabled: true">
       <a-assets>
         <video id="webcam" playsinline autoplay muted crossorigin="anonymous"></video>
       </a-assets>
 
-      <a-camera position="0 0 0" wasd-controls-enabled="false">
-        <a-video 
-          src="#webcam" 
-          width="16" height="9" 
-          position="0 0 -10">
-        </a-video>
-      </a-camera>
+      <a-entity id="rig">
+        <a-camera position="0 0 0" look-controls="enabled: true" wasd-controls-enabled="false">
+          <a-video 
+            src="#webcam" 
+            width="4" height="2.25" 
+            position="0 0 -1.5">
+          </a-video>
+        </a-camera>
+      </a-entity>
     </a-scene>
 
     <script>
@@ -38,30 +50,24 @@
       const btn = document.querySelector('#start-btn');
 
       btn.addEventListener('click', () => {
-        if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-          const constraints = {
-            video: {
-              facingMode: 'environment', // Specifically requests the back camera
-              width: { ideal: 1280 },
-              height: { ideal: 720 }
-            }
-          };
+        const constraints = {
+          video: {
+            facingMode: 'environment',
+            width: { ideal: 1920 },
+            height: { ideal: 1080 }
+          }
+        };
 
-          navigator.mediaDevices.getUserMedia(constraints)
-            .then((stream) => {
-              video.srcObject = stream;
-              // Crucial: Manually call play() after the stream is attached
-              video.play();
-              // Hide the button once the camera is active
-              btn.style.display = 'none';
-            })
-            .catch((err) => {
-              console.error("Camera error:", err);
-              alert("Camera error: " + err.name);
-            });
-        } else {
-          alert("Webcam API not supported in this browser.");
-        }
+        navigator.mediaDevices.getUserMedia(constraints)
+          .then((stream) => {
+            video.srcObject = stream;
+            video.play();
+            document.getElementById('ui-overlay').style.display = 'none';
+          })
+          .catch((err) => {
+            alert("Error accessing camera. Ensure you are on HTTPS.");
+            console.error(err);
+          });
       });
     </script>
   </body>
