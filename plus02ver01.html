@@ -1,0 +1,536 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, user-scalable=no">
+<title>Cardboard Passthrough (WebGL + Distortion + Head Tracking)</title>
+<style>
+  :root{
+    --ui-bg: rgba(0,0,0,0.55);
+    --ui-fg: #fff;
+    --gap-px: 14;          /* center gap (IPD spacer) in CSS px */
+    --reticle-size: 18;    /* CSS px */
+  }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #000; color: var(--ui-fg);
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    overflow: hidden; touch-action: manipulation;
+  }
+  #gl { position: fixed; inset: 0; width: 100%; height: 100%; display: block; background: #000; }
+  /* hidden camera video (used as WebGL texture) */
+  #cam { position: fixed; left: -9999px; top: -9999px; width: 1px; height: 1px; visibility: hidden; }
+
+  #controls {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 7;
+    display: flex; flex-wrap: wrap; gap: 8px;
+    padding: 10px env(safe-area-inset-right) calc(10px + env(safe-area-inset-bottom)) env(safe-area-inset-left);
+    justify-content: center; align-items: center;
+  }
+  .pill {
+    background: var(--ui-bg); color: var(--ui-fg);
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 999px; padding: 8px 12px; font-size: 14px;
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  #hud {
+    position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 8;
+    background: var(--ui-bg); color: #fff; font-size: 12px;
+    padding: 6px 10px; border-radius: 999px; border: 1px solid rgba(255,255,255,0.2);
+    user-select: none;
+  }
+
+  /* visual center gap / nose bridge (purely cosmetic) */
+  #gap {
+    position: fixed; top: 0; bottom: 0; left: 50%;
+    transform: translateX(calc(-50% - (var(--gap-px) / 2)));
+    width: calc(var(--gap-px) * 1px); background: #000; z-index: 5; pointer-events: none;
+  }
+
+  /* Hide UI in immersive mode */
+  .immersive #controls, .immersive #hud { display: none; }
+</style>
+</head>
+<body>
+  <div id="hud">Ready</div>
+  <div id="gap" aria-hidden="true"></div>
+  <canvas id="gl"></canvas>
+  <video id="cam" playsinline muted autoplay></video>
+
+  <div id="controls">
+    <button class="pill" id="btnStart">Start Camera</button>
+    <button class="pill" id="btnVR">Enter VR</button>
+    <button class="pill" id="btnExitVR" style="display:none;">Exit VR</button>
+    <button class="pill" id="btnCenter">Recenter</button>
+    <label class="pill">Gap <input id="rngGap" type="range" min="0" max="60" value="14"></label>
+    <label class="pill">Distortion <input id="rngK" type="range" min="0" max="100" value="55"></label>
+    <label class="pill"><input id="chkCA" type="checkbox" checked> Chrom. Aber.</label>
+  </div>
+
+<script>
+/* ======================
+ * Elements & State
+ * ====================== */
+const el = {
+  gl: document.getElementById('gl'),
+  cam: document.getElementById('cam'),
+  hud: document.getElementById('hud'),
+  btnStart: document.getElementById('btnStart'),
+  btnVR: document.getElementById('btnVR'),
+  btnExitVR: document.getElementById('btnExitVR'),
+  btnCenter: document.getElementById('btnCenter'),
+  rngGap: document.getElementById('rngGap'),
+  rngK: document.getElementById('rngK'),
+  chkCA: document.getElementById('chkCA'),
+  body: document.body,
+};
+const state = {
+  stream: null,
+  started: false,
+  gl: null,
+  prog: null,
+  progReticle: null,
+  tex: null,
+  vao: null,
+  dpr: Math.max(1, window.devicePixelRatio || 1),
+  animationId: null,
+  // Video "cover" mapping to fill the canvas
+  srcOrigin: [0, 0],
+  srcScale:  [1, 1],
+  // Head tracking (smoothed yaw/pitch) + recenter baseline
+  head: { yaw0: 0, pitch0: 0, roll0: 0, yaw: 0, pitch: 0, roll: 0, smoothYaw: 0, smoothPitch: 0 },
+};
+
+/* ======================
+ * WebGL setup
+ * ====================== */
+function createGL() {
+  const gl = el.gl.getContext('webgl', {
+    alpha: false, antialias: true, depth: false, stencil: false, preserveDrawingBuffer: false,
+    powerPreference: 'high-performance',
+  });
+  if (!gl) throw new Error('WebGL not supported');
+  state.gl = gl;
+
+  // ---- Camera pass: full-screen quad with barrel distortion ----
+  const vs = `
+    attribute vec2 aPos;
+    varying vec2 vUV;
+    void main(){
+      vUV = aPos * 0.5 + 0.5;       // clip [-1,1] -> uv [0,1]
+      gl_Position = vec4(aPos, 0.0, 1.0);
+    }
+  `;
+  const fs = `
+    precision mediump float;
+    varying vec2 vUV;
+    uniform sampler2D uTex;
+
+    // Distortion uniforms
+    uniform vec2 uLensCenter;     // eye-local center (0.5, 0.5)
+    uniform vec2 uScale;          // typically (0.5, 0.5)
+    uniform vec2 uScaleIn;        // typically (2.0, 2.0)
+    uniform vec4 uHmdWarpParam;   // K0..K3 (K0=1)
+    uniform vec4 uChromAbParam;   // (Ax, Ay, Bx, By)
+    uniform bool uDoCA;
+
+    // Video source rect (cover mapping) inside video texture
+    uniform vec2 uSrcOrigin;      // top-left [0..1]
+    uniform vec2 uSrcScale;       // size [0..1]
+
+    void main(){
+      // Lens space around uLensCenter
+      vec2 p = (vUV - uLensCenter) * uScaleIn; // ~[-1,1]
+      float r2 = dot(p, p);
+      float k  = uHmdWarpParam.x
+               + uHmdWarpParam.y * r2
+               + uHmdWarpParam.z * r2 * r2
+               + uHmdWarpParam.w * r2 * r2 * r2;
+
+      vec2 pG  = p * k;
+      vec2 uvG = uLensCenter + uScale * pG;
+
+      // Outside viewport -> vignette
+      if (uvG.x < 0.0 || uvG.x > 1.0 || uvG.y < 0.0 || uvG.y > 1.0) {
+        gl_FragColor = vec4(0.0,0.0,0.0,1.0);
+        return;
+      }
+
+      vec2 uvR = uvG, uvB = uvG;
+      if (uDoCA) {
+        vec2 rShift = (uChromAbParam.xy) * r2;
+        vec2 bShift = (uChromAbParam.zw) * r2;
+        uvR = uLensCenter + uScale * (pG + rShift);
+        uvB = uLensCenter + uScale * (pG + bShift);
+      }
+
+      // Map to the video "cover" rect
+      vec2 tG = uSrcOrigin + uvG * uSrcScale;
+      vec2 tR = uSrcOrigin + uvR * uSrcScale;
+      vec2 tB = uSrcOrigin + uvB * uSrcScale;
+
+      float r = texture2D(uTex, tR).r;
+      float g = texture2D(uTex, tG).g;
+      float b = texture2D(uTex, tB).b;
+      gl_FragColor = vec4(r,g,b,1.0);
+    }
+  `;
+  state.prog = createProgram(gl, vs, fs);
+
+  // ---- Reticle pass: post-warp point sprite with soft ring ----
+  const vsR = `
+    attribute vec2 aPos;        // clip-space [-1,1]
+    uniform float uPointSize;   // pixels (scaled by DPR)
+    void main(){
+      gl_PointSize = uPointSize;
+      gl_Position = vec4(aPos, 0.0, 1.0);
+    }
+  `;
+  const fsR = `
+    precision mediump float;
+    uniform vec4 uColor;
+    void main(){
+      vec2 uv = gl_PointCoord - vec2(0.5);
+      float d = length(uv);
+
+      // Discard outside the sprite to avoid any square artifacts
+      if (d > 0.5) discard;
+
+      float R = 0.48;           // outer radius
+      float border = 0.10;      // ring thickness
+      float alpha = smoothstep(R, R - 0.02, d) - smoothstep(R - border, R - border - 0.02, d);
+      if (alpha <= 0.0) discard;
+
+      gl_FragColor = vec4(uColor.rgb, uColor.a * alpha);
+    }
+  `;
+  state.progReticle = createProgram(gl, vsR, fsR);
+
+  // Geometry: two-triangle quad
+  const vao = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vao);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1,-1,  1,-1,  -1, 1,
+     1,-1,  1, 1,  -1, 1
+  ]), gl.STATIC_DRAW);
+  state.vao = vao;
+
+  // Video texture
+  state.tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, state.tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+  // Enable alpha blending for overlays (reticle)
+  gl.enable(gl.BLEND);
+  gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+}
+
+function createProgram(gl, vsSrc, fsSrc) {
+  const vs = compile(gl, gl.VERTEX_SHADER, vsSrc);
+  const fs = compile(gl, gl.FRAGMENT_SHADER, fsSrc);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs); gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    throw new Error('Program link error: ' + gl.getProgramInfoLog(prog));
+  }
+  return prog;
+}
+function compile(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src); gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error('Shader compile error: ' + gl.getShaderInfoLog(sh));
+  }
+  return sh;
+}
+
+/* ======================
+ * Camera + video "cover" mapping
+ * ====================== */
+async function startCamera() {
+  if (!navigator.mediaDevices?.getUserMedia) { setHUD('Camera API not supported.'); return; }
+  try {
+    setHUD('Starting camera…');
+    const constraints = {
+      audio: false,
+      video: {
+        facingMode: { ideal: 'environment' },
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+        frameRate: { ideal: 60, max: 60 }
+      }
+    };
+    state.stream = await navigator.mediaDevices.getUserMedia(constraints);
+    el.cam.srcObject = state.stream;
+    await el.cam.play();
+    state.started = true;
+    setHUD('Camera started');
+    resizeGL();
+    if (!state.animationId) render();
+  } catch (e) {
+    console.error(e);
+    setHUD('Camera failed. Check HTTPS & permissions.');
+  }
+}
+function stopCamera() {
+  if (state.stream) { state.stream.getTracks().forEach(t => t.stop()); state.stream = null; }
+  state.started = false;
+  if (state.animationId) { cancelAnimationFrame(state.animationId); state.animationId = null; }
+  setHUD('Camera stopped');
+}
+
+function resizeGL() {
+  const gl = state.gl;
+  const dpr = state.dpr = Math.max(1, window.devicePixelRatio || 1);
+  const rect = el.gl.getBoundingClientRect();
+  const w = Math.floor(rect.width * dpr), h = Math.floor(rect.height * dpr);
+  if (el.gl.width !== w || el.gl.height !== h) { el.gl.width = w; el.gl.height = h; }
+
+  // Compute "cover" mapping from video -> canvas
+  if (el.cam.videoWidth && el.cam.videoHeight) {
+    const vw = el.cam.videoWidth, vh = el.cam.videoHeight;
+    const dstAspect = w / h, vidAspect = vw / vh;
+    let sx=0, sy=0, sw=vw, sh=vh;
+    if (vidAspect > dstAspect) {
+      const newW = vh * dstAspect; const crop = (vw - newW) / 2; sx = crop; sw = newW;
+    } else {
+      const newH = vw / dstAspect; const crop = (vh - newH) / 2; sy = crop; sh = newH;
+    }
+    state.srcOrigin = [sx / vw, sy / vh];
+    state.srcScale  = [sw / vw, sh / vh];
+  }
+}
+
+/* ======================
+ * Head tracking (DeviceOrientation)
+ * ====================== */
+function normalizeAngleDeg(a){ a=(a+180)%360; if(a<0)a+=360; return a-180; }
+function recenter() {
+  state.head.yaw0 = state.head.yaw;
+  state.head.pitch0 = state.head.pitch;
+  state.head.roll0 = state.head.roll;
+  setHUD('Recentered');
+}
+function onDeviceOrientation(e) {
+  let { alpha, beta, gamma } = e;
+  if (alpha == null || beta == null || gamma == null) return;
+
+  let yaw = alpha;   // 0..360
+  let pitch = beta;  // -180..180
+  let roll = gamma;  // -90..90
+
+  // Adjust by screen orientation (landscape)
+  const angle = (screen.orientation?.angle || window.orientation || 0);
+  if (angle === 90) { const t=pitch; pitch = -roll; roll = t; }
+  else if (angle === -90 || angle === 270) { const t=pitch; pitch = roll; roll = -t; }
+
+  state.head.yaw = yaw; state.head.pitch = pitch; state.head.roll = roll;
+
+  // Smooth LERP toward baseline-relative angles
+  const ly = state.head.smoothYaw, lp = state.head.smoothPitch;
+  const targetYaw = normalizeAngleDeg(yaw - state.head.yaw0);
+  const targetPitch = (pitch - state.head.pitch0);
+  const s = 0.15; // smoothing factor
+  state.head.smoothYaw = ly + (targetYaw - ly) * s;
+  state.head.smoothPitch = lp + (targetPitch - lp) * s;
+}
+
+/* ======================
+ * Rendering
+ * ====================== */
+function render() {
+  const gl = state.gl;
+  state.animationId = requestAnimationFrame(render);
+
+  // Update texture from video
+  if (el.cam.readyState >= 2) {
+    gl.bindTexture(gl.TEXTURE_2D, state.tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, el.cam); } catch(e){}
+  }
+
+  const W = el.gl.width, H = el.gl.height;
+  gl.viewport(0, 0, W, H);
+  gl.clearColor(0,0,0,1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  // Eye viewports with middle gap (gap measured in CSS px -> device px)
+  const gapCss = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--gap-px')) || 0;
+  const gap = Math.floor(gapCss * state.dpr);
+  const eyeW = Math.floor((W - gap) / 2);
+  const eyeH = H;
+
+  // Distortion coefficients based on slider
+  const kStrength = parseFloat(el.rngK.value) / 100; // 0..1
+  // Tunable ranges for Cardboard-like optics
+  const K0 = 1.0;
+  const K1 = mix(-0.22, -0.34, kStrength);
+  const K2 = mix( 0.24,  0.55, kStrength);
+  const K3 = mix( 0.00,  0.10, kStrength);
+  const chrom = el.chkCA.checked;
+  // Small outward/inward channel shifts to reduce fringing
+  const CAxR =  0.006, CAyR =  0.006;
+  const CAxB = -0.006, CAyB = -0.006;
+
+  const srcOrigin = state.srcOrigin, srcScale = state.srcScale;
+
+  // --- Camera draw (left/right) ---
+  gl.useProgram(state.prog);
+  gl.bindBuffer(gl.ARRAY_BUFFER, state.vao);
+  const aPosLoc = gl.getAttribLocation(state.prog, 'aPos');
+  gl.enableVertexAttribArray(aPosLoc);
+  gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+  const locs = uniformCache(gl, state.prog, [
+    'uTex','uLensCenter','uScale','uScaleIn','uHmdWarpParam','uChromAbParam','uDoCA','uSrcOrigin','uSrcScale'
+  ]);
+  gl.uniform1i(locs.uTex, 0);
+  gl.uniform2f(locs.uScale, 0.5, 0.5);
+  gl.uniform2f(locs.uScaleIn, 2.0, 2.0);
+  gl.uniform4f(locs.uHmdWarpParam, K0, K1, K2, K3);
+  gl.uniform4f(locs.uChromAbParam, CAxR, CAyR, CAxB, CAyB);
+  gl.uniform1i(locs.uDoCA, chrom ? 1 : 0);
+  gl.uniform2f(locs.uSrcOrigin, srcOrigin[0], srcOrigin[1]);
+  gl.uniform2f(locs.uSrcScale,  srcScale[0],  srcScale[1]);
+
+  // Left eye
+  gl.enable(gl.SCISSOR_TEST);
+  gl.viewport(0, 0, eyeW, eyeH);
+  gl.scissor(0, 0, eyeW, eyeH);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.uniform2f(locs.uLensCenter, 0.5, 0.5);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+  // Right eye
+  const xRight = eyeW + gap;
+  gl.viewport(xRight, 0, eyeW, eyeH);
+  gl.scissor(xRight, 0, eyeW, eyeH);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.uniform2f(locs.uLensCenter, 0.5, 0.5);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
+  gl.disable(gl.SCISSOR_TEST);
+
+  // --- Overlays (reticle) ---
+  //drawReticle(0, 0, eyeW, eyeH);          // left viewport
+  //drawReticle(1, xRight, 0, eyeW, eyeH);  // right viewport
+}
+
+function drawReticle(eyeIndex, x=0, y=0, w, h) {
+  const gl = state.gl;
+  const yaw = state.head.smoothYaw, pitch = state.head.smoothPitch;
+
+  // Map yaw/pitch (±20°) to ±offset in eye-local clip space
+  const yawRange = 20, pitchRange = 20, maxNdc = 0.25;
+  const nx = clamp(yaw / yawRange, -1, 1) * maxNdc;
+  const ny = clamp(-pitch / pitchRange, -1, 1) * maxNdc;
+
+  const W = el.gl.width, H = el.gl.height;
+  const cx = x + w * (0.5 + nx), cy = y + h * (0.5 + ny);
+  const clipX = (cx / W) * 2.0 - 1.0, clipY = 1.0 - (cy / H) * 2.0;
+
+  gl.useProgram(state.progReticle);
+  const aPos = gl.getAttribLocation(state.progReticle, 'aPos');
+  const uPointSize = gl.getUniformLocation(state.progReticle, 'uPointSize');
+  const uColor = gl.getUniformLocation(state.progReticle, 'uColor');
+
+  // One point at (clipX, clipY)
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([clipX, clipY]), gl.STREAM_DRAW);
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  const cssPx = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--reticle-size')) || 18;
+  gl.uniform1f(uPointSize, cssPx * state.dpr);
+  gl.uniform4f(uColor, 1.0, 1.0, 1.0, 0.95);
+
+  // Ensure blending is on and scissor is off for overlays
+  gl.disable(gl.SCISSOR_TEST);
+  gl.enable(gl.BLEND);
+  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+  gl.drawArrays(gl.POINTS, 0, 1);
+  gl.deleteBuffer(buf);
+}
+
+function uniformCache(gl, prog, names){
+  const map={}; for(const n of names) map[n]=gl.getUniformLocation(prog,n); return map;
+}
+function clamp(x,a,b){ return Math.max(a, Math.min(b, x)); }
+function mix(a,b,t){ return a + (b-a)*t; }
+
+/* ======================
+ * Fullscreen / VR-like
+ * ====================== */
+async function enterVRLike() {
+  const root = document.documentElement;
+  if (root.requestFullscreen) await root.requestFullscreen({ navigationUI: "hide" });
+  try { await screen.orientation.lock('landscape'); } catch(e){}
+  el.body.classList.add('immersive');
+  el.btnVR.style.display = 'none';
+  el.btnExitVR.style.display = 'inline-block';
+}
+async function exitVRLike() {
+  if (document.fullscreenElement) await document.exitFullscreen();
+  try { screen.orientation.unlock?.(); } catch(e){}
+  el.body.classList.remove('immersive');
+  el.btnVR.style.display = 'inline-block';
+  el.btnExitVR.style.display = 'none';
+}
+
+/* ======================
+ * UI & Init
+ * ====================== */
+function setHUD(m){ el.hud.textContent = m; }
+function updateGapCss() {
+  const gap = parseInt(el.rngGap.value);
+  document.documentElement.style.setProperty('--gap-px', gap.toString());
+}
+function requestMotionPermissionIfNeeded() {
+  const DOR = window.DeviceOrientationEvent;
+  // iOS requires explicit permission; Android usually not, but safe to call.
+  if (typeof DOR !== 'undefined' && DOR?.requestPermission) {
+    DOR.requestPermission().catch(()=>{}).then(()=>{});
+  }
+}
+function onStartClick() {
+  if (!state.started) {
+    startCamera().then(()=>requestMotionPermissionIfNeeded());
+    el.btnStart.textContent = 'Stop Camera';
+  } else {
+    stopCamera();
+    el.btnStart.textContent = 'Start Camera';
+  }
+}
+
+function init() {
+  createGL();
+
+  // UI bindings
+  el.btnStart.addEventListener('click', onStartClick);
+  el.btnVR.addEventListener('click', async () => { if (!state.started) await startCamera(); await enterVRLike(); });
+  el.btnExitVR.addEventListener('click', exitVRLike);
+  el.btnCenter.addEventListener('click', recenter);
+  el.rngGap.addEventListener('input', updateGapCss);
+  el.rngK.addEventListener('input', ()=>{});
+  el.chkCA.addEventListener('change', ()=>{});
+  updateGapCss();
+
+  // Sensors & resize
+  window.addEventListener('deviceorientation', onDeviceOrientation, { passive: true });
+  window.addEventListener('resize', resizeGL);
+  window.addEventListener('orientationchange', () => setTimeout(resizeGL, 100));
+
+  resizeGL();
+  setHUD('Ready (tap Start Camera)');
+}
+window.addEventListener('load', init);
+</script>
+</body>
+</html>
