@@ -118,11 +118,6 @@ function createGL() {
   if (!gl) throw new Error('WebGL not supported');
   state.gl = gl;
 
-
-  // Enable standard alpha blending (non-premultiplied)
-  gl.enable(gl.BLEND);
-  gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-
   // Fullscreen quad
   const vs = `
     attribute vec2 aPos;
@@ -488,8 +483,8 @@ function render(ts=performance.now()) {
   gl.disable(gl.SCISSOR_TEST);
 
   // Reticle (post-warp)
-  drawReticle(0, 0, eyeW, eyeH);
-  drawReticle(1, xRight, 0, eyeW, eyeH);
+  //drawReticle(0, 0, eyeW, eyeH);
+  //drawReticle(1, xRight, 0, eyeW, eyeH);
 
   // Hands overlay (post-warp)
   if (state.handsEnabled && state.hands.length) {
