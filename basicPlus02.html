@@ -360,7 +360,7 @@ async function ensureHandKit() {
   const landmarker = await HandLandmarker.createFromOptions(fileset, {
     baseOptions: {
       //modelAssetPath: `${urlBase}/wasm/hand_landmarker.task`,
-      modelAssetPath: '/assets/hand_landmarker.task'
+      modelAssetPath: '/assets/hand_landmarker.task',
       delegate: 'GPU'
     },
     runningMode: 'VIDEO',
