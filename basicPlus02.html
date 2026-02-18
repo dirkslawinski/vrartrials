@@ -354,16 +354,12 @@ async function ensureHandKit() {
   if (state.handKit.landmarker) return;
   setHUD('Loading hand model…');
   // Lazy import ESM from CDN
-//  const urlBase = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
-    const urlBase = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.32';
+  const urlBase = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
   const { FilesetResolver, HandLandmarker } = await import(`${urlBase}/vision_bundle.mjs`);
   const fileset = await FilesetResolver.forVisionTasks(`${urlBase}/wasm`);
   const landmarker = await HandLandmarker.createFromOptions(fileset, {
     baseOptions: {
-//      modelAssetPath: `${urlBase}/wasm/hand_landmarker.task`,
-//	modelAssetPath:
-//      		'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
-    modelAssetPath: '/assets/hand_landmarker.task'
+      modelAssetPath: `${urlBase}/wasm/hand_landmarker.task`,
       delegate: 'GPU'
     },
     runningMode: 'VIDEO',
@@ -483,17 +479,16 @@ function render(ts=performance.now()) {
   gl.disable(gl.SCISSOR_TEST);
 
   // Reticle (post-warp)
-  //drawReticle(0, 0, eyeW, eyeH);
-  //drawReticle(1, xRight, 0, eyeW, eyeH);
+  drawReticle(0, 0, eyeW, eyeH);
+  drawReticle(1, xRight, 0, eyeW, eyeH);
 
   // Hands overlay (post-warp)
   if (state.handsEnabled && state.hands.length) {
-    drawHandsOverlay(0,      0, 0, eyeW, eyeH);             // left
+    drawHandsOverlay(0, 0, eyeW, eyeH);             // left
     drawHandsOverlay(1, xRight, 0, eyeW, eyeH);     // right
   }
 }
 
-/* 
 function drawReticle(eyeIndex, x=0, y=0, w, h) {
   const gl = state.gl;
   const yaw = state.head.smoothYaw, pitch = state.head.smoothPitch;
@@ -521,7 +516,6 @@ function drawReticle(eyeIndex, x=0, y=0, w, h) {
   gl.drawArrays(gl.POINTS, 0, 1);
   gl.deleteBuffer(buf);
 }
-*/
 
 /* ---- Hand overlay drawing (post-warp) ---- */
 const HAND_CONNECTIONS = [
