@@ -1,83 +1,106 @@
 <!DOCTYPE html>
 <html>
-  <head>
-    <title>Forced Cardboard Split-Screen</title>
-    <script src="https://aframe.io/releases/1.4.0/aframe.min.js"></script>
+<head>
+    <title>Manual Cardboard Passthrough</title>
     <style>
-      #controls {
-        position: absolute;
-        top: 10px;
-        left: 10px;
-        z-index: 9999;
-      }
-      button { padding: 10px; cursor: pointer; }
+        body { margin: 0; background: #000; overflow: hidden; display: flex; }
+        
+        /* The two viewports */
+        .viewport {
+            width: 50vw;
+            height: 100vh;
+            object-fit: cover;
+            border-right: 1px solid #222; /* Center line for alignment */
+        }
+
+        #controls {
+            position: absolute;
+            top: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 10;
+        }
+
+        button {
+            padding: 15px 30px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        /* Hide the source video element */
+        #sourceVideo { display: none; }
     </style>
-  </head>
-  <body>
+</head>
+<body>
+
     <div id="controls">
-      <button id="start-btn">1. Start Camera</button>
+        <button id="btn">Start Passthrough</button>
     </div>
 
-    <a-scene background="color: black" stats>
-      <a-assets>
-        <video id="webcam" playsinline autoplay muted crossorigin="anonymous"></video>
-      </a-assets>
+    <video id="sourceVideo" autoplay playsinline muted></video>
 
-      <a-entity id="left-eye" camera="active: true" position="-0.03 0 0" look-controls>
-        <a-video src="#webcam" width="16" height="9" position="0 0 -10"></a-video>
-      </a-entity>
-
-      <a-entity id="right-eye" camera="active: true" position="0.03 0 0" look-controls>
-        <a-video src="#webcam" width="16" height="9" position="0 0 -10"></a-video>
-      </a-entity>
-    </a-scene>
+    <canvas id="leftEye" class="viewport"></canvas>
+    <canvas id="rightEye" class="viewport"></canvas>
 
     <script>
-      const video = document.querySelector('#webcam');
-      const btn = document.querySelector('#start-btn');
+        const video = document.getElementById('sourceVideo');
+        const leftCanvas = document.getElementById('leftEye');
+        const rightCanvas = document.getElementById('rightEye');
+        const leftCtx = leftCanvas.getContext('2d');
+        const rightCtx = rightCanvas.getContext('2d');
+        const btn = document.getElementById('btn');
 
-      // Manual Camera Setup
-      btn.addEventListener('click', () => {
-        navigator.mediaDevices.getUserMedia({ 
-          video: { facingMode: 'environment', width: 1280, height: 720 } 
-        })
-        .then(stream => {
-          video.srcObject = stream;
-          video.play();
-          btn.style.display = 'none';
-          setupViewports();
-        });
-      });
+        btn.onclick = async () => {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: 'environment' } 
+                });
+                video.srcObject = stream;
+                btn.style.display = 'none';
+                
+                // Initialize drawing loop
+                requestAnimationFrame(render);
+            } catch (err) {
+                console.error("Camera error:", err);
+            }
+        };
 
-      function setupViewports() {
-        const sceneEl = document.querySelector('a-scene');
-        
-        // This force-injects the renderer settings for split screen
-        sceneEl.addEventListener('render-target-loaded', () => {
-          const renderer = sceneEl.renderer;
-          renderer.setScissorTest(true);
-        });
+        function render() {
+            if (video.readyState === video.HAVE_ENOUGH_DATA) {
+                // Set canvas internal resolution to match display size
+                if (leftCanvas.width !== leftCanvas.clientWidth) {
+                    leftCanvas.width = rightCanvas.width = leftCanvas.clientWidth;
+                    leftCanvas.height = rightCanvas.height = leftCanvas.clientHeight;
+                }
 
-        sceneEl.addEventListener('render-tick', () => {
-          const renderer = sceneEl.renderer;
-          const size = new THREE.Vector2();
-          renderer.getSize(size);
+                // Draw to Left Eye
+                drawFrame(leftCtx, leftCanvas);
+                // Draw to Right Eye
+                drawFrame(rightCtx, rightCanvas);
+            }
+            requestAnimationFrame(render);
+        }
 
-          const leftCamera = document.querySelector('#left-eye').components.camera.camera;
-          const rightCamera = document.querySelector('#right-eye').components.camera.camera;
+        function drawFrame(ctx, canvas) {
+            // Calculate scale to "Cover" the viewport while maintaining aspect ratio
+            const videoRatio = video.videoWidth / video.videoHeight;
+            const canvasRatio = canvas.width / canvas.height;
+            let drawWidth, drawHeight, offsetX, offsetY;
 
-          // Render Left Eye
-          renderer.setViewport(0, 0, size.x / 2, size.y);
-          renderer.setScissor(0, 0, size.x / 2, size.y);
-          renderer.render(sceneEl.object3D, leftCamera);
+            if (videoRatio > canvasRatio) {
+                drawHeight = canvas.height;
+                drawWidth = canvas.height * videoRatio;
+                offsetX = -(drawWidth - canvas.width) / 2;
+                offsetY = 0;
+            } else {
+                drawWidth = canvas.width;
+                drawHeight = canvas.width / videoRatio;
+                offsetX = 0;
+                offsetY = -(drawHeight - canvas.height) / 2;
+            }
 
-          // Render Right Eye
-          renderer.setViewport(size.x / 2, 0, size.x / 2, size.y);
-          renderer.setScissor(size.x / 2, 0, size.x / 2, size.y);
-          renderer.render(sceneEl.object3D, rightCamera);
-        }, false);
-      }
+            ctx.drawImage(video, offsetX, offsetY, drawWidth, drawHeight);
+        }
     </script>
-  </body>
+</body>
 </html>
-
