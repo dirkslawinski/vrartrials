@@ -362,7 +362,7 @@ async function ensureHandKit() {
     baseOptions: {
 //      modelAssetPath: `${urlBase}/wasm/hand_landmarker.task`,
 //	modelAssetPath:
-      		'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+//      		'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
 	modelAssetPath: '/assets/hand_landmarker.task'
       delegate: 'GPU'
     },
@@ -488,7 +488,7 @@ function render(ts=performance.now()) {
 
   // Hands overlay (post-warp)
   if (state.handsEnabled && state.hands.length) {
-    drawHandsOverlay(0, 0, eyeW, eyeH);             // left
+    drawHandsOverlay(0, 0, 0, eyeW, eyeH);             // left
     drawHandsOverlay(1, xRight, 0, eyeW, eyeH);     // right
   }
 }
