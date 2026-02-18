@@ -488,7 +488,7 @@ function render(ts=performance.now()) {
 
   // Hands overlay (post-warp)
   if (state.handsEnabled && state.hands.length) {
-    drawHandsOverlay(0, 0, eyeW, eyeH);             // left
+    drawHandsOverlay(0, 0, 0, eyeW, eyeH);             // left
     drawHandsOverlay(1, xRight, 0, eyeW, eyeH);     // right
   }
 }
